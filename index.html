@@ -107,6 +107,10 @@ main{flex:1;display:flex;min-height:0}
 .row:last-child{margin-bottom:0}
 .row label{flex:1;font-size:12.5px;color:var(--dim)}
 .row .val{font-family:var(--mono);font-size:11px;color:var(--gold);min-width:38px;text-align:right}
+.vin{width:56px;flex:none;font-family:var(--mono);font-size:11px;color:var(--gold);text-align:right;
+  background:transparent;border:1px solid transparent;border-radius:6px;padding:4px 5px;appearance:textfield}
+.vin::-webkit-inner-spin-button,.vin::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.vin:focus{border-color:var(--line2);background:var(--panel2);color:var(--ink)}
 input[type=range]{flex:1.4;appearance:none;-webkit-appearance:none;height:3px;border-radius:2px;background:var(--line2);outline:none}
 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--gold);
   border:3px solid var(--panel);box-shadow:0 0 0 1px var(--line2)}
@@ -201,7 +205,7 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
 <body>
 
 <header>
-  <div class="brand"><h1>NS <em>PhotoFlow</em></h1><span class="ver">v0.6</span></div>
+  <div class="brand"><h1>NS <em>PhotoFlow</em></h1><span class="ver">v0.7</span></div>
   <span class="gpu-tag" id="gpuTag">WASM</span>
   <div class="hdr-sp"></div>
   <span class="hdr-count" id="hdrCount">0 ảnh</span>
@@ -334,12 +338,11 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
 
 <script>
 /* ============================================================
-   NS PhotoFlow v0.6 — Pipeline xử lý ảnh sản phẩm
-   v0.6: bộ chỉnh sáng/màu kiểu Lightroom (Phơi sáng, Tương phản,
-   Vùng sáng/tối, Trắng/Đen, Nhiệt màu, Sắc thái, Rực màu, Bão hòa,
-   Trong nét, Sắc nét — pipeline per-pixel thật) · bóng đổ THEO
-   HÌNH sản phẩm + hướng đổ (squash + shear + fade xa + lõi tiếp
-   xúc) thay ellipse ngang giả · (v0.5: biến đổi tự do, AI retouch)
+   NS PhotoFlow v0.7 — Pipeline xử lý ảnh sản phẩm
+   v0.7: kéo bóng trực tiếp trên ảnh bằng tay (shX/shY) · MỌI thanh
+   chỉnh nhập được số · kéo mượt (preview hạ độ phân giải khi kéo,
+   thả tay render nét) · reset chỉnh màu · (v0.6: bộ Lightroom +
+   bóng theo hình sản phẩm)
    ============================================================ */
 'use strict';
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
@@ -356,7 +359,7 @@ const HAS_GPU=!!navigator.gpu;
 const DEF_FIN={auto:true,sOp:0,sBlur:26,sDist:6,contact:38,sWidth:78,posY:3,gloss:0,bri:100,con:100,sat:100,warm:0,
   rot:0,zoom:100,offX:0,shX:0,even:0,smooth:0,
   expo:0,ctr:0,hi:0,shd:0,wht:0,blk:0,temp:0,tint:0,vib:0,sat2:0,clar:0,shp:0,
-  sMode:'shape',sDir:18,sSquash:30};
+  sMode:'shape',sDir:18,sSquash:30,shY:0};
 
 /* ---------- State ---------- */
 const STEPS=[
@@ -367,7 +370,7 @@ const STEPS=[
   {id:'out',  lb:'Xuất ảnh',  ic:'<path d="M12 15V3m0 12l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/>'}
 ];
 const S={
-  items:[], sel:-1, step:0, busy:false, sync:false,
+  items:[], sel:-1, step:0, busy:false, sync:false, shDrag:false, dragQ:false,
   engine:store('nsf_engine', HAS_GPU?'biref':'std'),
   exp:Object.assign({sizes:[{w:1200,h:1200,on:true}],pad:8,fmt:'jpg',q:92,bgMode:'white',pat:'{ten}_{w}x{h}',sr:false},store('nsf_exp',{})),
   templates:store('nsf_tpl',[]),
@@ -447,7 +450,8 @@ function renderStageNow(){
   else if(S.step===2){src=alignPreview(it);v.classList.add('white');}
   else{
     const sz=firstSize();
-    const ps=Math.min(1,900/Math.max(sz.w,sz.h));
+    const cap=S.dragQ?540:900;
+    const ps=Math.min(1,cap/Math.max(sz.w,sz.h));
     src=renderFinal(it,Math.max(80,Math.round(sz.w*ps)),Math.max(80,Math.round(sz.h*ps)));
     v.classList.add('white');
   }
@@ -468,6 +472,7 @@ function stageZoomPan(){
   },{passive:false});
   body.addEventListener('pointerdown',e=>{
     if(!cur())return;ptr.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    if(S.step===3&&S.shDrag)S.dragQ=true;
     if(ptr.size===2){const a=[...ptr.values()];pinch0={d:Math.hypot(a[0].x-a[1].x,a[0].y-a[1].y),s:VS.s}}
   });
   body.addEventListener('pointermove',e=>{
@@ -480,6 +485,15 @@ function stageZoomPan(){
       VS.s=clamp(pinch0.s*d/pinch0.d,1,8);
       if(VS.s<=1.01){VS.s=1;VS.tx=0;VS.ty=0}
       applyVS();return;
+    }
+    if(ptr.size===1&&S.step===3&&S.shDrag&&cur()){
+      const it=cur();const rect=$('#view').getBoundingClientRect();
+      it.fin.shX=clamp((it.fin.shX??0)+(e.clientX-p.x)/rect.width*100/VS.s,-90,90);
+      it.fin.shY=clamp((it.fin.shY??0)+(e.clientY-p.y)/rect.height*100/VS.s,-70,45);
+      const sx=$('#fShX'),sy=$('#fShY');
+      if(sx){sx.value=Math.round(it.fin.shX);const n=$('#fShXV');if(n)n.value=sx.value}
+      if(sy){sy.value=Math.round(it.fin.shY);const n=$('#fShYV');if(n)n.value=sy.value}
+      ptr.set(e.pointerId,{x:e.clientX,y:e.clientY});renderStage();return;
     }
     if(VS.s>1){VS.tx+=e.clientX-p.x;VS.ty+=e.clientY-p.y;applyVS()}
     ptr.set(e.pointerId,{x:e.clientX,y:e.clientY});
@@ -497,6 +511,7 @@ function renderTools(){
   if(it&&S.step<=1&&it.img)h+=b('tCrop','Cắt & xoay');
   if(it&&S.step===1&&it.cut){h+=b('tBrush','Cọ nền')+b('tCurve','Nắn cong')+b('tLiq','Liquify');}
   if(it&&it.cut&&S.step<=1)h+=b('tCmp','Giữ: xem gốc','ghost');
+  if(it&&it.cut&&S.step===3)h+=`<button class="btn sm ${S.shDrag?'teal':'ghost'}" id="tShDrag">◑ Kéo bóng</button>`;
   h+=`<span style="flex:1"></span>`;
   if(it)h+=b('tZo','−','ghost')+b('tZr',Math.round(VS.s*100)+'%','ghost')+b('tZi','+','ghost');
   if(S.step<4)h+=b('tNext','Bước tiếp →','gold');
@@ -510,6 +525,8 @@ function renderTools(){
   const br=$('#tBrush');if(br)br.onclick=openBrush;
   const cv=$('#tCurve');if(cv)cv.onclick=openCurve;
   const cr=$('#tCrop');if(cr)cr.onclick=openCrop;
+  const sd=$('#tShDrag');if(sd)sd.onclick=()=>{S.shDrag=!S.shDrag;renderTools();
+    toast(S.shDrag?'Đang bật: kéo trên ảnh để dời bóng':'Đã tắt kéo bóng — kéo để phóng/di chuyển ảnh')};
   const cmp=$('#tCmp');
   if(cmp){
     const showOrig=()=>{const v=$('#view');const s=Math.min(1,1400/Math.max(it.img.width,it.img.height));
@@ -1645,7 +1662,7 @@ function renderFinal(it,W,H,prodOverride){
   if(zoom<=1.02)dy=clamp(dy,H*0.02,Math.max(H*0.02,H-dh-H*0.02));
   // ── bóng đổ (vẽ TRƯỚC sản phẩm) ──
   if(f.contact>0){
-    const cxp=dx+dw/2+W*shX/100, cyp=dy+dh;
+    const cxp=dx+dw/2+W*shX/100, cyp=dy+dh+H*(f.shY??0)/100;
     if((f.sMode??'shape')==='shape'){
       /* Bóng THEO HÌNH sản phẩm: silhouette ép dẹt + xiên theo
          hướng đổ, nhòe dần và nhạt dần về phía xa, kèm lõi tiếp
@@ -1886,7 +1903,8 @@ const ICO={
 };
 const card=(t,ic,body)=>`<div class="card"><h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">${ic}</svg>${t}</h3>${body}</div>`;
 const slider=(id,lb,min,max,val,step=1)=>`<div class="row"><label>${lb}</label>
-  <input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${val}"><span class="val" id="${id}V">${val}</span></div>`;
+  <input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${val}">
+  <input type="number" class="vin" id="${id}V" min="${min}" max="${max}" step="${step}" value="${val}"></div>`;
 
 function renderPanel(){
   const p=$('#panel');const it=cur();
@@ -1986,7 +2004,8 @@ function renderPanel(){
       `<p class="hint">Làm mướt khử gợn, bụi, loang màu trên vỏ nón nhưng giữ cạnh sắc. Ánh sáng đều bù chỗ tối chỗ sáng do đèn lệch. Áp khi thả tay slider (xử lý full-res).</p>`);
     h+=card('Ánh sáng',ICO.sun,`
       <div class="row"><label>Tự cân sáng chuẩn (auto levels)</label><span class="sw"><input type="checkbox" id="fAuto" ${f.auto?'checked':''}><i></i></span></div>
-      <div class="row"><label>Chỉnh đồng loạt tất cả ảnh</label><span class="sw"><input type="checkbox" id="fSync" ${S.sync?'checked':''}><i></i></span></div>`+
+      <div class="row"><label>Chỉnh đồng loạt tất cả ảnh</label><span class="sw"><input type="checkbox" id="fSync" ${S.sync?'checked':''}><i></i></span></div>
+      <button class="btn sm full ghost" id="fResetTone" style="margin-bottom:8px">Đặt lại chỉnh màu</button>`+
       slider('fExpo','Phơi sáng',-60,60,f.expo??0)+
       slider('fCtr','Tương phản',-50,50,f.ctr??0)+
       slider('fHi','Vùng sáng',-100,100,f.hi??0)+
@@ -2013,12 +2032,13 @@ function renderPanel(){
       slider('fSDir','Hướng đổ bóng (°)',-60,60,f.sDir??18)+
       slider('fSSq','Độ dẹt bóng',15,60,f.sSquash??30)+
       slider('fSBlur','Độ nhòe',6,60,f.sBlur)+
-      slider('fShX','Lệch bóng ngang',-30,30,f.shX??0)+
+      slider('fShX','Lệch bóng ngang',-90,90,f.shX??0)+
+      slider('fShY','Lệch bóng dọc',-70,45,f.shY??0)+
       slider('fSWidth','Rộng (kiểu ellipse)',50,110,f.sWidth??78)+
       slider('fSOp','Bóng mềm phụ',0,40,f.sOp)+
       slider('fGloss','Độ bóng sản phẩm',0,60,f.gloss)+
       `<button class="btn sm full" id="fCopy" style="margin-top:8px">Áp thiết lập cho tất cả</button>
-      <p class="hint">Bóng theo hình = silhouette sản phẩm ép dẹt, đổ xiên theo hướng, nhòe & nhạt dần về xa, kèm lõi tiếp xúc đậm sát đáy — như bóng studio thật. Kéo "Hướng đổ" âm/dương để bóng ngả trái/phải theo góc chụp.</p>`);
+      <p class="hint">Bấm <b>◑ Kéo bóng</b> trên thanh công cụ rồi cầm kéo bóng đi bất cứ đâu bằng tay. Bóng theo hình = silhouette sản phẩm ép dẹt, đổ xiên theo hướng, nhòe & nhạt dần về xa, kèm lõi tiếp xúc đậm sát đáy.</p>`);
     h+=presetCard();
   }
   if(S.step===4){
@@ -2055,8 +2075,16 @@ function renderPanel(){
 function bindPanel(){
   const it=cur();
   const on=(id,ev,fn)=>{const el=$('#'+id);if(el)el[ev]=fn};
-  const bindSlider=(id,fn,live=true)=>{const el=$('#'+id);if(!el)return;
-    el.oninput=()=>{$('#'+id+'V').textContent=el.value;fn(+el.value);if(live)renderStage()}};
+  const bindSlider=(id,fn,live=true)=>{
+    const el=$('#'+id),num=$('#'+id+'V');if(!el)return;
+    const run=v=>{fn(v);if(live)renderStage()};
+    el.oninput=()=>{if(num)num.value=el.value;run(+el.value)};
+    if(num){
+      num.oninput=()=>{const r=num.value;if(r===''||r==='-'||r==='.')return;
+        let v=clamp(parseFloat(r),+el.min,+el.max);if(isNaN(v))return;el.value=v;run(v)};
+      num.onchange=()=>{let v=clamp(parseFloat(num.value)||0,+el.min,+el.max);num.value=v;el.value=v;run(v)};
+    }
+  };
   // step 0
   on('btnPick','onclick',()=>$('#fileIn').click());
   on('btnCam','onclick',()=>$('#camIn').click());
@@ -2083,11 +2111,12 @@ function bindPanel(){
   on('rL','onclick',()=>xformItem(it,(c,bg)=>rotCanvas(c,-90,bg)));
   on('rR','onclick',()=>xformItem(it,(c,bg)=>rotCanvas(c,90,bg)));
   on('rF','onclick',()=>xformItem(it,(c,bg)=>flipCanvas(c,bg)));
-  {const el=$('#rAng');
-   if(el){el.oninput=()=>{$('#rAngV').textContent=el.value};
-     el.onchange=()=>{const a=+el.value;if(!a)return;
-       xformItem(it,(c,bg)=>rotCanvas(c,a,bg));
-       el.value=0;$('#rAngV').textContent='0';toast('Đã xoay '+a+'°')};}}
+  {const el=$('#rAng'),num=$('#rAngV');
+   if(el){el.oninput=()=>{if(num)num.value=el.value};
+     const applyRot=a=>{if(!a)return;xformItem(it,(c,bg)=>rotCanvas(c,a,bg));
+       el.value=0;if(num)num.value=0;toast('Đã xoay '+a+'°')};
+     el.onchange=()=>applyRot(+el.value);
+     if(num)num.onchange=()=>{el.value=clamp(parseFloat(num.value)||0,-180,180);applyRot(+el.value)};}}
   // step 2
   $$('.tpl-it').forEach(el=>{
     el.onclick=e=>{
@@ -2117,6 +2146,11 @@ function bindPanel(){
     if(S.sync)S.items.forEach(set);else set(it);
     renderPanel();renderStage();toast('Đã áp bóng chuẩn sàn TMĐT');
   });
+  on('fResetTone','onclick',()=>{
+    const set=x=>Object.assign(x.fin,{expo:0,ctr:0,hi:0,shd:0,wht:0,blk:0,temp:0,tint:0,vib:0,sat2:0,clar:0,shp:0});
+    if(S.sync)S.items.forEach(set);else set(it);
+    renderPanel();renderStage();toast('Đã đặt lại chỉnh màu');
+  });
   on('fSMode','onchange',()=>{
     const v=$('#fSMode').value;
     if(S.sync)S.items.forEach(x=>x.fin.sMode=v);else it.fin.sMode=v;
@@ -2127,7 +2161,7 @@ function bindPanel(){
     if(S.sync)S.items.forEach(set);else set(it);
     renderPanel();renderStage();
   });
-  ['fContact:contact','fSWidth:sWidth','fShX:shX','fSOp:sOp','fSBlur:sBlur','fSDir:sDir','fSSq:sSquash','fGloss:gloss',
+  ['fContact:contact','fSWidth:sWidth','fShX:shX','fShY:shY','fSOp:sOp','fSBlur:sBlur','fSDir:sDir','fSSq:sSquash','fGloss:gloss',
    'fRot:rot','fZoom:zoom','fOffX:offX','fPosY:posY',
    'fExpo:expo','fCtr:ctr','fHi:hi','fShd:shd','fWht:wht','fBlk:blk',
    'fTemp:temp','fTint:tint','fVib:vib','fSat2:sat2','fClar:clar','fShp:shp']
@@ -2137,13 +2171,12 @@ function bindPanel(){
     })});
   // retouch nặng (full-res): áp khi thả tay
   [['fSmooth','smooth'],['fEven','even']].forEach(([id,k])=>{
-    const el=$('#'+id);if(!el)return;
-    el.oninput=()=>{$('#'+id+'V').textContent=el.value};
-    el.onchange=()=>{const v=+el.value;
-      const ap=x=>{x.fin[k]=v;dirty(x)};
-      if(S.sync)S.items.forEach(ap);else ap(it);
-      renderStage();
-    };
+    const el=$('#'+id),num=$('#'+id+'V');if(!el)return;
+    const ap=v=>{const set=x=>{x.fin[k]=v;dirty(x)};
+      if(S.sync)S.items.forEach(set);else set(it);renderStage()};
+    el.oninput=()=>{if(num)num.value=el.value};
+    el.onchange=()=>ap(+el.value);
+    if(num)num.onchange=()=>{let v=clamp(parseFloat(num.value)||0,+el.min,+el.max);num.value=v;el.value=v;ap(v)};
   });
   on('fCopy','onclick',()=>{S.items.forEach(x=>{if(x!==it){x.fin={...it.fin};dirty(x)}});toast('Đã áp thiết lập cho tất cả');});
   // step 4
@@ -2184,6 +2217,12 @@ $('#tplIn').onchange=async e=>{
 };
 
 /* ---------- Global inputs ---------- */
+document.addEventListener('pointerdown',e=>{
+  if(e.target&&e.target.matches&&e.target.matches('input[type=range]'))S.dragQ=true;
+},true);
+const _endDrag=()=>{if(S.dragQ){S.dragQ=false;renderStage()}};
+document.addEventListener('pointerup',_endDrag,true);
+document.addEventListener('pointercancel',_endDrag,true);
 $('#fileIn').onchange=e=>{addFiles(e.target.files);e.target.value=''};
 $('#camIn').onchange=e=>{addFiles(e.target.files);e.target.value=''};
 document.addEventListener('dragover',e=>e.preventDefault());
