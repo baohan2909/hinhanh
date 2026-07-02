@@ -201,7 +201,7 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
 <body>
 
 <header>
-  <div class="brand"><h1>NS <em>PhotoFlow</em></h1><span class="ver">v0.5</span></div>
+  <div class="brand"><h1>NS <em>PhotoFlow</em></h1><span class="ver">v0.6</span></div>
   <span class="gpu-tag" id="gpuTag">WASM</span>
   <div class="hdr-sp"></div>
   <span class="hdr-count" id="hdrCount">0 ảnh</span>
@@ -334,12 +334,12 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
 
 <script>
 /* ============================================================
-   NS PhotoFlow v0.5 — Pipeline xử lý ảnh sản phẩm
-   v0.5: biến đổi sản phẩm tự do (xoay/phóng/dời, không phá gốc) ·
-   AI retouch: làm mướt bề mặt + ánh sáng đều + nút Auto hoàn thiện ·
-   nút zoom −/100%/+ trên toolbar mọi bước · lệch bóng ngang ·
-   xoay tinh chỉnh live · (v0.4: bóng tiếp đất, nắn cong Bezier,
-   lasso, zoom/undo/redo modal, sửa toggle khung mẫu)
+   NS PhotoFlow v0.6 — Pipeline xử lý ảnh sản phẩm
+   v0.6: bộ chỉnh sáng/màu kiểu Lightroom (Phơi sáng, Tương phản,
+   Vùng sáng/tối, Trắng/Đen, Nhiệt màu, Sắc thái, Rực màu, Bão hòa,
+   Trong nét, Sắc nét — pipeline per-pixel thật) · bóng đổ THEO
+   HÌNH sản phẩm + hướng đổ (squash + shear + fade xa + lõi tiếp
+   xúc) thay ellipse ngang giả · (v0.5: biến đổi tự do, AI retouch)
    ============================================================ */
 'use strict';
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
@@ -353,8 +353,10 @@ const store=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){r
 const save=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){toast('Bộ nhớ trình duyệt đầy — thiết lập không lưu được')}};
 const TJS='https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';
 const HAS_GPU=!!navigator.gpu;
-const DEF_FIN={auto:true,sOp:10,sBlur:24,sDist:6,contact:38,sWidth:78,posY:3,gloss:0,bri:100,con:103,sat:102,warm:0,
-  rot:0,zoom:100,offX:0,shX:0,even:0,smooth:0};
+const DEF_FIN={auto:true,sOp:0,sBlur:26,sDist:6,contact:38,sWidth:78,posY:3,gloss:0,bri:100,con:100,sat:100,warm:0,
+  rot:0,zoom:100,offX:0,shX:0,even:0,smooth:0,
+  expo:0,ctr:0,hi:0,shd:0,wht:0,blk:0,temp:0,tint:0,vib:0,sat2:0,clar:0,shp:0,
+  sMode:'shape',sDir:18,sSquash:30};
 
 /* ---------- State ---------- */
 const STEPS=[
@@ -813,11 +815,12 @@ function analyze(it){
 function smartAuto(it){
   const a=analyze(it);if(!a)return false;
   it.fin.auto=true;it.lut=null;dirty(it);
-  it.fin.bri=clamp(Math.round(100*150/Math.max(70,a.med)),85,128);
-  it.fin.con=a.spread<135?112:104;
-  it.fin.sat=105;
+  it.fin.expo=clamp(Math.round((150-a.med)*0.75),-30,42);
+  it.fin.ctr=a.spread<135?14:6;
+  it.fin.vib=12;
   const cast=a.r-a.b;
-  it.fin.warm=clamp(Math.round(-cast*0.45),-35,35);
+  it.fin.temp=clamp(Math.round(-cast*0.8),-35,35);
+  it.fin.bri=100;it.fin.con=100;it.fin.sat=100;it.fin.warm=0;
   return true;
 }
 function smartAutoAll(){
@@ -1540,6 +1543,78 @@ function alphaBBox(cv){
 /* Bóng đổ chân thật: ellipse tiếp đất ngay dưới đáy sản phẩm
    (kiểu ảnh sàn TMĐT) + bóng mềm nhẹ tùy chọn. Sản phẩm luôn
    auto-crop theo bbox và neo theo Vị trí dọc. */
+/* ── Pipeline tông màu kiểu Lightroom ─────────────────────────
+   Đường cong 256 mức: Phơi sáng → Tương phản → Vùng sáng/tối →
+   Trắng/Đen; sau đó Nhiệt màu/Sắc thái (gain kênh), Trong nét
+   (local contrast), Sắc nét (unsharp), Rực màu/Bão hòa. Chạy trên
+   canvas sản phẩm ở độ phân giải render nên preview vẫn mượt. */
+function toneLUT(f){
+  const L=new Uint8ClampedArray(256);
+  const ex=(f.expo??0)/100, ct=(f.ctr??0)/100, hi=(f.hi??0)/100,
+        sh=(f.shd??0)/100, wh=(f.wht??0)/100, bl=(f.blk??0)/100;
+  for(let i=0;i<256;i++){
+    let v=i/255;
+    if(ex)v*=Math.pow(2,ex*1.25);
+    if(ct)v=0.5+(v-0.5)*(1+ct*0.9);
+    if(hi){const t=smoothstep(0.45,1,v);v+=hi*0.55*t*(1-clamp(v,0,1));}
+    if(sh){const t=smoothstep(0.55,0,v);v+=sh*0.55*t*(1-clamp(v,0,1));}
+    if(wh)v+=wh*0.5*v*v;
+    if(bl)v+=bl*0.45*Math.pow(1-clamp(v,0,1),3);
+    L[i]=clamp(Math.round(v*255),0,255);
+  }
+  return L;
+}
+function toneProduct(pc,f){
+  const need=['expo','ctr','hi','shd','wht','blk','temp','tint','vib','sat2'].some(k=>(f[k]??0)!==0);
+  const needC=(f.clar??0)>0, needS=(f.shp??0)>0;
+  if(!need&&!needC&&!needS)return pc;
+  const W=pc.width,H=pc.height;
+  const c=cloneCanvas(pc);
+  const id=cx(c).getImageData(0,0,W,H);const d=id.data;
+  let dB=null,dS=null;
+  if(needC||needS){
+    let n=0,ar=0,ag=0,ab=0;
+    for(let i=0;i<W*H;i+=13){if(d[i*4+3]>60){n++;ar+=d[i*4];ag+=d[i*4+1];ab+=d[i*4+2]}}
+    const fill=mk(W,H),fg=cx(fill);
+    fg.fillStyle=`rgb(${n?ar/n|0:127},${n?ag/n|0:127},${n?ab/n|0:127})`;
+    fg.fillRect(0,0,W,H);fg.drawImage(c,0,0);
+    if(needC){const b=mk(W,H),g2=cx(b);
+      g2.filter=`blur(${Math.max(6,Math.round(Math.min(W,H)/45))}px)`;
+      g2.drawImage(fill,0,0);dB=g2.getImageData(0,0,W,H).data;}
+    if(needS){const b=mk(W,H),g2=cx(b);
+      g2.filter='blur(1.1px)';
+      g2.drawImage(fill,0,0);dS=g2.getImageData(0,0,W,H).data;}
+  }
+  const L=need?toneLUT(f):null;
+  const tp=(f.temp??0)/100, tn=(f.tint??0)/100, vib=(f.vib??0)/100, st=(f.sat2??0)/100;
+  const ck=(f.clar??0)/100*0.85, sk=(f.shp??0)/100*0.95;
+  for(let i=0;i<W*H;i++){
+    const j=i*4;if(d[j+3]<8)continue;
+    let r=d[j],g=d[j+1],b=d[j+2];
+    if(L){r=L[r];g=L[g];b=L[b];}
+    if(tp){r*=1+tp*0.26;b*=1-tp*0.26;}
+    if(tn){g*=1-tn*0.2;r*=1+tn*0.1;b*=1+tn*0.1;}
+    if(ck&&dB){
+      const lum=0.299*r+0.587*g+0.114*b;
+      const lb=0.299*dB[j]+0.587*dB[j+1]+0.114*dB[j+2];
+      const e=(lum-lb)*ck;
+      r+=e;g+=e;b+=e;
+    }
+    if(sk&&dS){
+      r+=(r-dS[j])*sk;g+=(g-dS[j+1])*sk;b+=(b-dS[j+2])*sk;
+    }
+    if(vib||st){
+      const mx=Math.max(r,g,b),mn=Math.min(r,g,b);
+      const avg=(r+g+b)/3;
+      let k=1+st*0.9;
+      if(vib)k+=vib*(1-(mx-mn)/Math.max(60,mx))*0.9;
+      r=avg+(r-avg)*k;g=avg+(g-avg)*k;b=avg+(b-avg)*k;
+    }
+    d[j]=clamp(r,0,255);d[j+1]=clamp(g,0,255);d[j+2]=clamp(b,0,255);
+  }
+  cx(c).putImageData(id,0,0);
+  return c;
+}
 function renderFinal(it,W,H,prodOverride){
   const c=mk(W,H),g=cx(c);
   if(S.exp.bgMode==='white'){g.fillStyle='#FFFFFF';g.fillRect(0,0,W,H)}
@@ -1558,6 +1633,7 @@ function renderFinal(it,W,H,prodOverride){
     const crop=mk(Math.max(2,Math.round(bb0.w*ws)),Math.max(2,Math.round(bb0.h*ws)));
     cx(crop).drawImage(prod,bb0.x,bb0.y,bb0.w,bb0.h,0,0,crop.width,crop.height);
     pc=rot?rotCanvas(crop,rot,null):crop;
+    pc=toneProduct(pc,f);
     pbb=rot?alphaBBox(pc):{x:0,y:0,w:pc.width,h:pc.height};
   }
   const pad=S.exp.pad/100;
@@ -1567,21 +1643,56 @@ function renderFinal(it,W,H,prodOverride){
   const dx=(W-dw)/2 + W*offX/100;
   let dy=(H-dh)/2 + H*posY/100;
   if(zoom<=1.02)dy=clamp(dy,H*0.02,Math.max(H*0.02,H-dh-H*0.02));
-  // ── bóng tiếp đất (ellipse, vẽ TRƯỚC sản phẩm để dính vào đáy) ──
+  // ── bóng đổ (vẽ TRƯỚC sản phẩm) ──
   if(f.contact>0){
     const cxp=dx+dw/2+W*shX/100, cyp=dy+dh;
-    const rw=dw*0.5*(sWidth/100)*1.15;
-    const rh=Math.max(5,dw*0.075);
-    g.save();
-    g.translate(cxp,cyp-rh*0.18);
-    g.scale(1,rh/rw);
-    const gr=g.createRadialGradient(0,0,0,0,0,rw);
-    gr.addColorStop(0,`rgba(18,20,24,${(f.contact/100)*0.85})`);
-    gr.addColorStop(0.5,`rgba(18,20,24,${(f.contact/100)*0.35})`);
-    gr.addColorStop(1,'rgba(18,20,24,0)');
-    g.fillStyle=gr;
-    g.beginPath();g.arc(0,0,rw,0,7);g.fill();
-    g.restore();
+    if((f.sMode??'shape')==='shape'){
+      /* Bóng THEO HÌNH sản phẩm: silhouette ép dẹt + xiên theo
+         hướng đổ, nhòe dần và nhạt dần về phía xa, kèm lõi tiếp
+         xúc đậm sát đáy — giống bóng thật trong studio. */
+      const sq=clamp((f.sSquash??30)/100,0.12,0.65);
+      const shear=Math.tan(clamp(f.sDir??18,-60,60)*Math.PI/180)*0.9;
+      const sqH=dh*sq;
+      const sil=silhouette(pc,'#101216');
+      const tmp=mk(W,H),tg=cx(tmp);
+      tg.translate(cxp,cyp);
+      tg.transform(1,0,-shear,1,0,0);
+      tg.drawImage(sil,pbb.x,pbb.y,pbb.w,pbb.h, -dw/2, -sqH*0.94, dw, sqH);
+      // nhạt dần về phía xa
+      tg.setTransform(1,0,0,1,0,0);
+      tg.globalCompositeOperation='destination-out';
+      const fgr=tg.createLinearGradient(0,cyp-sqH-Math.abs(shear)*sqH,0,cyp);
+      fgr.addColorStop(0,'rgba(0,0,0,.78)');
+      fgr.addColorStop(1,'rgba(0,0,0,0)');
+      tg.fillStyle=fgr;tg.fillRect(0,0,W,H);
+      g.save();
+      g.filter=`blur(${((f.sBlur??26)*W/1200).toFixed(1)}px)`;
+      g.globalAlpha=f.contact/100;
+      g.drawImage(tmp,0,0);
+      g.restore();
+      // lõi tiếp xúc mảnh sát đáy
+      const rw=dw*0.34, rh=Math.max(4,dw*0.045);
+      g.save();g.translate(cxp,cyp-rh*0.1);g.scale(1,rh/rw);
+      const gr=g.createRadialGradient(0,0,0,0,0,rw);
+      gr.addColorStop(0,`rgba(14,16,19,${(f.contact/100)*0.5})`);
+      gr.addColorStop(1,'rgba(14,16,19,0)');
+      g.fillStyle=gr;g.beginPath();g.arc(0,0,rw,0,7);g.fill();
+      g.restore();
+    }else{
+      // Ellipse tiếp đất cổ điển
+      const rw=dw*0.5*(sWidth/100)*1.15;
+      const rh=Math.max(5,dw*0.075);
+      g.save();
+      g.translate(cxp,cyp-rh*0.18);
+      g.scale(1,rh/rw);
+      const gr=g.createRadialGradient(0,0,0,0,0,rw);
+      gr.addColorStop(0,`rgba(18,20,24,${(f.contact/100)*0.85})`);
+      gr.addColorStop(0.5,`rgba(18,20,24,${(f.contact/100)*0.35})`);
+      gr.addColorStop(1,'rgba(18,20,24,0)');
+      g.fillStyle=gr;
+      g.beginPath();g.arc(0,0,rw,0,7);g.fill();
+      g.restore();
+    }
   }
   // ── bóng mềm nhẹ (halo dưới thấp, tùy chọn) ──
   if(f.sOp>0){
@@ -1873,24 +1984,41 @@ function renderPanel(){
       slider('fSmooth','Làm mướt bề mặt',0,70,f.smooth??0)+
       slider('fEven','Ánh sáng đều',0,60,f.even??0)+
       `<p class="hint">Làm mướt khử gợn, bụi, loang màu trên vỏ nón nhưng giữ cạnh sắc. Ánh sáng đều bù chỗ tối chỗ sáng do đèn lệch. Áp khi thả tay slider (xử lý full-res).</p>`);
-    h+=card('Cân sáng & màu',ICO.sun,`
-      <div class="row"><label>Tự cân sáng chuẩn</label><span class="sw"><input type="checkbox" id="fAuto" ${f.auto?'checked':''}><i></i></span></div>
+    h+=card('Ánh sáng',ICO.sun,`
+      <div class="row"><label>Tự cân sáng chuẩn (auto levels)</label><span class="sw"><input type="checkbox" id="fAuto" ${f.auto?'checked':''}><i></i></span></div>
       <div class="row"><label>Chỉnh đồng loạt tất cả ảnh</label><span class="sw"><input type="checkbox" id="fSync" ${S.sync?'checked':''}><i></i></span></div>`+
-      slider('fBri','Sáng',70,140,f.bri)+
-      slider('fCon','Tương phản',70,140,f.con)+
-      slider('fSat','Màu sắc',60,150,f.sat)+
-      slider('fWarm','Ấm / lạnh',-50,50,f.warm));
+      slider('fExpo','Phơi sáng',-60,60,f.expo??0)+
+      slider('fCtr','Tương phản',-50,50,f.ctr??0)+
+      slider('fHi','Vùng sáng',-100,100,f.hi??0)+
+      slider('fShd','Vùng tối',-100,100,f.shd??0)+
+      slider('fWht','Trắng',-50,50,f.wht??0)+
+      slider('fBlk','Đen',-50,50,f.blk??0));
+    h+=card('Màu sắc',ICO.sun,
+      slider('fTemp','Nhiệt màu (lạnh ↔ ấm)',-60,60,f.temp??0)+
+      slider('fTint','Sắc thái (lục ↔ hồng)',-60,60,f.tint??0)+
+      slider('fVib','Rực màu (vibrance)',-60,60,f.vib??0)+
+      slider('fSat2','Bão hòa (saturation)',-60,60,f.sat2??0));
+    h+=card('Chi tiết',ICO.brain,
+      slider('fClar','Trong nét (clarity)',0,70,f.clar??0)+
+      slider('fShp','Sắc nét (sharpen)',0,70,f.shp??0)+
+      `<p class="hint">Trong nét tăng tương phản cục bộ làm nón "nổi khối"; Sắc nét làm rõ chi tiết logo, vân vải.</p>`);
     h+=card('Bóng đổ',ICO.sun,`
-      <button class="btn sm full teal" id="fEcom" style="margin-bottom:9px">Bóng chuẩn sàn TMĐT (một chạm)</button>`+
-      slider('fContact','Đậm bóng tiếp đất',0,70,f.contact)+
-      slider('fSWidth','Rộng bóng',50,110,f.sWidth??78)+
+      <div class="row"><label>Kiểu bóng</label>
+        <select id="fSMode" style="flex:1.4;width:auto">
+          <option value="shape" ${(f.sMode??'shape')==='shape'?'selected':''}>Theo hình sản phẩm (thật)</option>
+          <option value="ellipse" ${f.sMode==='ellipse'?'selected':''}>Ellipse tiếp đất</option>
+        </select></div>
+      <button class="btn sm full teal" id="fEcom" style="margin:2px 0 9px">Bóng chuẩn sàn TMĐT (một chạm)</button>`+
+      slider('fContact','Đậm bóng',0,70,f.contact)+
+      slider('fSDir','Hướng đổ bóng (°)',-60,60,f.sDir??18)+
+      slider('fSSq','Độ dẹt bóng',15,60,f.sSquash??30)+
+      slider('fSBlur','Độ nhòe',6,60,f.sBlur)+
       slider('fShX','Lệch bóng ngang',-30,30,f.shX??0)+
+      slider('fSWidth','Rộng (kiểu ellipse)',50,110,f.sWidth??78)+
       slider('fSOp','Bóng mềm phụ',0,40,f.sOp)+
-      slider('fSBlur','Độ nhòe bóng phụ',6,60,f.sBlur)+
-      slider('fSDist','Khoảng đổ phụ',0,40,f.sDist)+
       slider('fGloss','Độ bóng sản phẩm',0,60,f.gloss)+
       `<button class="btn sm full" id="fCopy" style="margin-top:8px">Áp thiết lập cho tất cả</button>
-      <p class="hint">Bóng tiếp đất dính ngay đáy sản phẩm; bóng mềm phụ để 0 nếu muốn nền thật sạch.</p>`);
+      <p class="hint">Bóng theo hình = silhouette sản phẩm ép dẹt, đổ xiên theo hướng, nhòe & nhạt dần về xa, kèm lõi tiếp xúc đậm sát đáy — như bóng studio thật. Kéo "Hướng đổ" âm/dương để bóng ngả trái/phải theo góc chụp.</p>`);
     h+=presetCard();
   }
   if(S.step===4){
@@ -1985,16 +2113,24 @@ function bindPanel(){
   on('fAuto','onchange',()=>{it.fin.auto=$('#fAuto').checked;it.lut=null;dirty(it);renderStage()});
   on('fSync','onchange',()=>{S.sync=$('#fSync').checked;toast(S.sync?'Kéo slider sẽ áp cho tất cả ảnh':'Chỉnh riêng từng ảnh')});
   on('fEcom','onclick',()=>{
-    const set=x=>{Object.assign(x.fin,{contact:40,sWidth:76,sOp:0,sDist:5,posY:4,gloss:0})};
+    const set=x=>{Object.assign(x.fin,{sMode:'shape',contact:42,sDir:18,sSquash:30,sBlur:26,sOp:0,posY:4,gloss:0})};
     if(S.sync)S.items.forEach(set);else set(it);
     renderPanel();renderStage();toast('Đã áp bóng chuẩn sàn TMĐT');
+  });
+  on('fSMode','onchange',()=>{
+    const v=$('#fSMode').value;
+    if(S.sync)S.items.forEach(x=>x.fin.sMode=v);else it.fin.sMode=v;
+    renderStage();
   });
   on('fXfReset','onclick',()=>{
     const set=x=>{Object.assign(x.fin,{rot:0,zoom:100,offX:0,posY:3})};
     if(S.sync)S.items.forEach(set);else set(it);
     renderPanel();renderStage();
   });
-  ['fBri:bri','fCon:con','fSat:sat','fWarm:warm','fContact:contact','fSWidth:sWidth','fShX:shX','fSOp:sOp','fSBlur:sBlur','fSDist:sDist','fGloss:gloss','fRot:rot','fZoom:zoom','fOffX:offX','fPosY:posY']
+  ['fContact:contact','fSWidth:sWidth','fShX:shX','fSOp:sOp','fSBlur:sBlur','fSDir:sDir','fSSq:sSquash','fGloss:gloss',
+   'fRot:rot','fZoom:zoom','fOffX:offX','fPosY:posY',
+   'fExpo:expo','fCtr:ctr','fHi:hi','fShd:shd','fWht:wht','fBlk:blk',
+   'fTemp:temp','fTint:tint','fVib:vib','fSat2:sat2','fClar:clar','fShp:shp']
     .forEach(m=>{const[id,k]=m.split(':');bindSlider(id,v=>{
       if(S.sync)S.items.forEach(x=>x.fin[k]=v);
       else it.fin[k]=v;
