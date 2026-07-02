@@ -40,6 +40,8 @@ header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:
 .brand .ver{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
 .hdr-sp{flex:1}
 .hdr-count{font-family:var(--mono);font-size:11px;color:var(--dim)}
+.gpu-tag{font-family:var(--mono);font-size:9.5px;padding:3px 8px;border-radius:12px;border:1px solid var(--line2);color:var(--faint)}
+.gpu-tag.on{border-color:var(--teal);color:var(--teal)}
 
 .flow{display:flex;align-items:stretch;padding:12px 16px 10px;gap:0;border-bottom:1px solid var(--line);
   overflow-x:auto;flex:none;scrollbar-width:none}
@@ -198,7 +200,8 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
 <body>
 
 <header>
-  <div class="brand"><h1>NS <em>PhotoFlow</em></h1><span class="ver">v0.2</span></div>
+  <div class="brand"><h1>NS <em>PhotoFlow</em></h1><span class="ver">v0.3</span></div>
+  <span class="gpu-tag" id="gpuTag">WASM</span>
   <div class="hdr-sp"></div>
   <span class="hdr-count" id="hdrCount">0 ảnh</span>
 </header>
@@ -244,7 +247,7 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
   </div>
 </div>
 
-<!-- Cọ nền: tẩy / khôi phục -->
+<!-- Cọ nền -->
 <div class="modal" id="brModal">
   <div class="modal-hd">
     <h2>Cọ nền — tẩy &amp; khôi phục</h2>
@@ -278,8 +281,18 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
   </div>
   <div class="modal-body"><canvas id="crCanvas"></canvas></div>
   <div class="modal-ft">
+    <div class="row"><label>Tỉ lệ khung</label>
+      <select id="crRatio" style="flex:1.4;width:auto">
+        <option value="0">Tự do</option>
+        <option value="1">1 : 1 (vuông)</option>
+        <option value="0.75">3 : 4 (dọc)</option>
+        <option value="0.8">4 : 5 (Shopee)</option>
+        <option value="1.3333">4 : 3 (ngang)</option>
+        <option value="1.7778">16 : 9</option>
+        <option value="exp">Theo cỡ xuất</option>
+      </select></div>
     <div class="row"><label>Cân thẳng (°)</label><input type="range" id="crAng" min="-15" max="15" step="0.2" value="0"><span class="val" id="crAngV">0</span></div>
-    <p class="hint" style="margin:0">Kéo 4 góc để chọn vùng cắt, kéo trong khung để dời. Áp dụng sẽ chạy lại tách nền nếu ảnh đã tách.</p>
+    <p class="hint" style="margin:0">Kéo 4 góc để chọn vùng cắt (tự giữ đúng tỉ lệ), kéo trong khung để dời. Áp dụng sẽ chạy lại tách nền nếu ảnh đã tách.</p>
   </div>
 </div>
 
@@ -290,20 +303,23 @@ select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
 
 <script>
 /* ============================================================
-   NS PhotoFlow v0.2 — Pipeline xử lý ảnh sản phẩm
-   v0.2: preset nhóm sản phẩm · cọ tẩy/khôi phục nền · cắt & xoay
-   · zoom/pan vùng xem · so sánh trước/sau · xuất đa kích thước
-   Stack: 100% trình duyệt, GitHub Pages, không server.
+   NS PhotoFlow v0.3 — Pipeline xử lý ảnh sản phẩm
+   v0.3: BiRefNet-lite WebGPU (fallback WASM chuẩn) · AI upscale 2×
+   khi xuất · AI cân chỉnh thông minh · chỉnh đồng loạt nhiều ảnh
+   · crop theo tỉ lệ · nút Tự động toàn bộ · sửa treo slider (cache
+   + preview nhẹ) · nền xuất trắng/trong suốt
    ============================================================ */
 'use strict';
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
 const smoothstep=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t)};
 const mk=(w,h)=>{const c=document.createElement('canvas');c.width=w;c.height=h;return c};
-const cx=c=>c.getContext('2d',{willReadFrequently:true});
+const cx=c=>{const g=c.getContext('2d',{willReadFrequently:true});g.imageSmoothingQuality='high';return g};
 function toast(m,ms=2600){const t=$('#toast');t.textContent=m;t.classList.add('on');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('on'),ms)}
 const store=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}};
 const save=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){toast('Bộ nhớ trình duyệt đầy — thiết lập không lưu được')}};
+const TJS='https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';
+const HAS_GPU=!!navigator.gpu;
 
 /* ---------- State ---------- */
 const STEPS=[
@@ -314,21 +330,23 @@ const STEPS=[
   {id:'out',  lb:'Xuất ảnh',  ic:'<path d="M12 15V3m0 12l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/>'}
 ];
 const S={
-  items:[], sel:-1, step:0, busy:false,
-  exp:Object.assign({sizes:[{w:1200,h:1200,on:true}],pad:8,fmt:'jpg',q:92,bg:'#FFFFFF',pat:'{ten}_{w}x{h}'},store('nsf_exp',{})),
+  items:[], sel:-1, step:0, busy:false, sync:false,
+  engine:store('nsf_engine', HAS_GPU?'biref':'std'),
+  exp:Object.assign({sizes:[{w:1200,h:1200,on:true}],pad:8,fmt:'jpg',q:92,bgMode:'white',pat:'{ten}_{w}x{h}',sr:false},store('nsf_exp',{})),
   templates:store('nsf_tpl',[]),
   presets:store('nsf_presets',[])
 };
 const defItem=(name,blob)=>({
   id:Math.random().toString(36).slice(2), name, blob,
   img:null, cutRaw:null, cut:null,
-  aligned:null,
+  aligned:null, _adj:null, _sr:null,
   edge:{smooth:3, sharp:78},
   align:{on:false, tpl:null, tx:0, ty:0, sc:1, rot:0},
   fin:{auto:true, sOp:22, sBlur:26, sDist:10, contact:34, gloss:0, bri:100, con:103, sat:102, warm:0},
   lut:null, done:[true,false,false,false,false], running:false
 });
 const cur=()=>S.items[S.sel]||null;
+const dirty=it=>{it._adj=null;it._sr=null};
 
 /* ---------- Workflow rail ---------- */
 function renderFlow(){
@@ -376,7 +394,12 @@ function applyVS(){
   const zt=$('#zoomTag');zt.textContent=Math.round(VS.s*100)+'%';
   zt.classList.toggle('on',Math.abs(VS.s-1)>0.01);
 }
-function renderStage(){
+let _stageRaf=0;
+function renderStage(){ // throttle qua rAF — kéo slider không treo
+  if(_stageRaf)return;
+  _stageRaf=requestAnimationFrame(()=>{_stageRaf=0;renderStageNow()});
+}
+function renderStageNow(){
   const v=$('#view'),e=$('#empty'),it=cur();
   $('#hdrCount').textContent=S.items.length+' ảnh';
   if(!it||!it.img){v.style.display='none';e.style.display='block';renderTools();return}
@@ -384,7 +407,12 @@ function renderStage(){
   let src=null;v.classList.remove('white');
   if(S.step<=1){src=it.cut||it.img;}
   else if(S.step===2){src=alignPreview(it);v.classList.add('white');}
-  else{const sz=firstSize();src=renderFinal(it,sz.w,sz.h);v.classList.add('white');}
+  else{ // preview nhẹ: giữ tỉ lệ cỡ xuất nhưng tối đa 900px
+    const sz=firstSize();
+    const ps=Math.min(1,900/Math.max(sz.w,sz.h));
+    src=renderFinal(it,Math.max(80,Math.round(sz.w*ps)),Math.max(80,Math.round(sz.h*ps)));
+    v.classList.add('white');
+  }
   const MAX=1400,s=Math.min(1,MAX/Math.max(src.width,src.height));
   v.width=src.width*s;v.height=src.height*s;
   const g=cx(v);g.clearRect(0,0,v.width,v.height);g.drawImage(src,0,0,v.width,v.height);
@@ -473,9 +501,9 @@ async function addFiles(files){
 }
 
 /* ============================================================
-   CẮT & XOAY ẢNH GỐC
+   CẮT & XOAY — có tỉ lệ khung cố định
    ============================================================ */
-const CR={rc:null,rot:0,ang:0,rect:null,ds:1,drag:null};
+const CR={rc:null,rot:0,ang:0,rect:null,ds:1,drag:null,ratio:0};
 function rotCanvas(src,deg){
   const r=deg*Math.PI/180;
   const W=src.width,H=src.height;
@@ -486,12 +514,19 @@ function rotCanvas(src,deg){
   g.translate(cw/2,ch/2);g.rotate(r);g.drawImage(src,-W/2,-H/2);
   return c;
 }
+function crRectForRatio(){
+  const W=CR.rc.width,H=CR.rc.height,ra=CR.ratio;
+  if(!ra){CR.rect={x:0,y:0,w:W,h:H};return}
+  let w=W,h=w/ra;
+  if(h>H){h=H;w=h*ra}
+  CR.rect={x:(W-w)/2,y:(H-h)/2,w,h};
+}
 function crRebuild(resetRect){
   const it=cur();
   CR.rc=rotCanvas(it.img,CR.rot*90+CR.ang);
-  if(resetRect)CR.rect={x:0,y:0,w:CR.rc.width,h:CR.rc.height};
+  if(resetRect)crRectForRatio();
   const c=$('#crCanvas');
-  const maxW=innerWidth-40,maxH=innerHeight-190;
+  const maxW=innerWidth-40,maxH=innerHeight-210;
   CR.ds=Math.min(1,maxW/CR.rc.width,maxH/CR.rc.height);
   c.width=Math.round(CR.rc.width*CR.ds);c.height=Math.round(CR.rc.height*CR.ds);
   crDraw();
@@ -520,35 +555,56 @@ function crPointer(){
   c.onpointerdown=e=>{
     c.setPointerCapture(e.pointerId);
     const p=pos(e),r=CR.rect,T=26/CR.ds;
-    const corners=[['tl',r.x,r.y],['tr',r.x+r.w,r.y],['bl',r.x,r.y+r.h],['br',r.x+r.w,r.y+r.h]];
-    for(const[k,cxp,cyp]of corners){
-      if(Math.hypot(p.x-cxp,p.y-cyp)<T){CR.drag={k,p};return}
+    const corners=[['tl',r.x,r.y,r.x+r.w,r.y+r.h],['tr',r.x+r.w,r.y,r.x,r.y+r.h],
+                   ['bl',r.x,r.y+r.h,r.x+r.w,r.y],['br',r.x+r.w,r.y+r.h,r.x,r.y]];
+    for(const[k,cxp,cyp,ax,ay]of corners){
+      if(Math.hypot(p.x-cxp,p.y-cyp)<T){CR.drag={k,p,ax,ay};return}
     }
     if(p.x>r.x&&p.x<r.x+r.w&&p.y>r.y&&p.y<r.y+r.h)CR.drag={k:'mv',p};
   };
   c.onpointerup=()=>CR.drag=null;
   c.onpointermove=e=>{
     if(!CR.drag)return;
-    const p=pos(e),r=CR.rect,dx=p.x-CR.drag.p.x,dy=p.y-CR.drag.p.y,k=CR.drag.k;
-    const MIN=40;
-    if(k==='mv'){r.x=clamp(r.x+dx,0,CR.rc.width-r.w);r.y=clamp(r.y+dy,0,CR.rc.height-r.h)}
-    if(k==='tl'){const nx=clamp(r.x+dx,0,r.x+r.w-MIN),ny=clamp(r.y+dy,0,r.y+r.h-MIN);r.w+=r.x-nx;r.h+=r.y-ny;r.x=nx;r.y=ny}
-    if(k==='tr'){r.w=clamp(r.w+dx,MIN,CR.rc.width-r.x);const ny=clamp(r.y+dy,0,r.y+r.h-MIN);r.h+=r.y-ny;r.y=ny}
-    if(k==='bl'){const nx=clamp(r.x+dx,0,r.x+r.w-MIN);r.w+=r.x-nx;r.x=nx;r.h=clamp(r.h+dy,MIN,CR.rc.height-r.y)}
-    if(k==='br'){r.w=clamp(r.w+dx,MIN,CR.rc.width-r.x);r.h=clamp(r.h+dy,MIN,CR.rc.height-r.y)}
-    CR.drag.p=p;crDraw();
+    const p=pos(e),r=CR.rect,k=CR.drag.k;
+    const MIN=40,W=CR.rc.width,H=CR.rc.height;
+    if(k==='mv'){
+      const dx=p.x-CR.drag.p.x,dy=p.y-CR.drag.p.y;
+      r.x=clamp(r.x+dx,0,W-r.w);r.y=clamp(r.y+dy,0,H-r.h);
+      CR.drag.p=p;crDraw();return;
+    }
+    // kéo góc quanh mỏ neo (góc đối diện) — giữ tỉ lệ nếu chọn
+    const ax=CR.drag.ax,ay=CR.drag.ay;
+    const px=clamp(p.x,0,W),py=clamp(p.y,0,H);
+    let w=Math.max(MIN,Math.abs(px-ax)),h=Math.max(MIN,Math.abs(py-ay));
+    if(CR.ratio){
+      h=w/CR.ratio;
+      const maxH=py>=ay?H-ay:ay;
+      if(h>maxH){h=maxH;w=h*CR.ratio}
+      const maxW=px>=ax?W-ax:ax;
+      if(w>maxW){w=maxW;h=w/CR.ratio}
+    }
+    r.x=px>=ax?ax:ax-w;r.y=py>=ay?ay:ay-h;
+    r.w=w;r.h=h;
+    r.x=clamp(r.x,0,W-r.w);r.y=clamp(r.y,0,H-r.h);
+    crDraw();
   };
 }
 function openCrop(){
   const it=cur();if(!it||!it.img)return;
-  CR.rot=0;CR.ang=0;
-  $('#crAng').value=0;$('#crAngV').textContent='0';
+  CR.rot=0;CR.ang=0;CR.ratio=0;
+  $('#crAng').value=0;$('#crAngV').textContent='0';$('#crRatio').value='0';
   crRebuild(true);
   $('#crModal').classList.add('on');
 }
 $('#crL').onclick=()=>{CR.rot=(CR.rot+3)%4;crRebuild(true)};
 $('#crR').onclick=()=>{CR.rot=(CR.rot+1)%4;crRebuild(true)};
 $('#crAng').oninput=()=>{CR.ang=+$('#crAng').value;$('#crAngV').textContent=CR.ang;crRebuild(true)};
+$('#crRatio').onchange=()=>{
+  const v=$('#crRatio').value;
+  if(v==='exp'){const sz=firstSize();CR.ratio=sz.w/sz.h}
+  else CR.ratio=+v;
+  crRectForRatio();crDraw();
+};
 $('#crCancel').onclick=()=>$('#crModal').classList.remove('on');
 $('#crApply').onclick=()=>{
   const it=cur();const r=CR.rect;
@@ -556,7 +612,7 @@ $('#crApply').onclick=()=>{
   cx(c).drawImage(CR.rc,r.x,r.y,r.w,r.h,0,0,c.width,c.height);
   it.img=c;
   const hadCut=!!it.cutRaw;
-  it.cutRaw=null;it.cut=null;it.aligned=null;it.lut=null;
+  it.cutRaw=null;it.cut=null;it.aligned=null;it.lut=null;dirty(it);
   it.done=[true,false,false,false,false];
   $('#crModal').classList.remove('on');
   renderAll();
@@ -564,24 +620,66 @@ $('#crApply').onclick=()=>{
 };
 
 /* ============================================================
-   BƯỚC 1 — TÁCH NỀN (AI client-side) + LÀM MƯỢT VIỀN
+   BƯỚC 1 — TÁCH NỀN: BiRefNet WebGPU / chuẩn WASM + VIỀN CONG
    ============================================================ */
-let _imgly=null;
+let _imgly=null,_bir=null,_birFailed=false;
 async function imgly(){
   if(_imgly)return _imgly;
-  toast('Đang tải AI tách nền (lần đầu ~40MB, các lần sau dùng cache)…',4000);
+  toast('Đang tải AI tách nền tiêu chuẩn (~40MB lần đầu)…',4000);
   _imgly=await import('https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.5.5/+esm');
   return _imgly;
 }
-async function removeBg(it,onp){
+async function birefnet(onp){
+  if(_bir)return _bir;
+  const T=await import(TJS+'/+esm');
+  const device=HAS_GPU?'webgpu':'wasm';
+  const dtype=HAS_GPU?'fp16':'q8';
+  const opts={device,dtype,progress_callback:d=>{
+    if(onp&&d.status==='progress'&&d.total)onp(d.loaded/d.total,'Tải BiRefNet: '+(d.file||''))}};
+  const model=await T.AutoModel.from_pretrained('onnx-community/BiRefNet_lite-ONNX',opts);
+  const processor=await T.AutoProcessor.from_pretrained('onnx-community/BiRefNet_lite-ONNX');
+  _bir={T,model,processor};
+  return _bir;
+}
+async function cutBiref(it,onp){
+  const {T,model,processor}=await birefnet(onp);
+  const blob=await new Promise(r=>it.img.toBlob(r,'image/png'));
+  const url=URL.createObjectURL(blob);
+  const image=await T.RawImage.fromURL(url);
+  URL.revokeObjectURL(url);
+  if(onp)onp(0.5,'Đang suy luận BiRefNet…');
+  const {pixel_values}=await processor(image);
+  const res=await model({input_image:pixel_values});
+  const t=Object.values(res)[0];
+  const mask=await T.RawImage.fromTensor(t[0].sigmoid().mul(255).to('uint8')).resize(image.width,image.height);
+  const W=it.img.width,H=it.img.height;
+  const c=mk(W,H);const g=cx(c);
+  g.drawImage(it.img,0,0);
+  const id=g.getImageData(0,0,W,H);
+  const md=mask.data;
+  for(let i=0;i<W*H;i++)id.data[i*4+3]=md[i];
+  g.putImageData(id,0,0);
+  return c;
+}
+async function cutStd(it,onp){
   const m=await imgly();
   const srcBlob=await new Promise(r=>it.img.toBlob(r,'image/png'));
   const blob=await m.removeBackground(srcBlob,{output:{format:'image/png'},
-    progress:(k,c,t)=>{if(onp&&t)onp(c/t)}});
+    progress:(k,c,t)=>{if(onp&&t)onp(c/t,'AI tiêu chuẩn')}});
   const bmp=await createImageBitmap(blob);
   const c=mk(it.img.width,it.img.height);
   cx(c).drawImage(bmp,0,0,c.width,c.height);
-  it.cutRaw=c;
+  return c;
+}
+async function removeBg(it,onp){
+  let out=null;
+  if(S.engine==='biref'&&!_birFailed){
+    try{out=await cutBiref(it,onp)}
+    catch(e){console.error('BiRefNet lỗi, chuyển engine chuẩn:',e);
+      _birFailed=true;toast('BiRefNet không chạy được trên máy này — chuyển AI tiêu chuẩn');}
+  }
+  if(!out)out=await cutStd(it,onp);
+  it.cutRaw=out;
   applyEdge(it);
   it.done[1]=true;
 }
@@ -607,23 +705,79 @@ function applyEdge(it){
     od.data[i*4+3]=na;
   }
   og.putImageData(od,0,0);
-  it.cut=out;it.aligned=null;it.lut=null;
+  it.cut=out;it.aligned=null;it.lut=null;dirty(it);
 }
 async function runCutAll(){
   if(S.busy)return;S.busy=true;
-  const pr=$('#cutProg'),pl=$('#cutLabel');
   const list=S.items.filter(x=>!x.done[1]);
   let n=0;
   for(const it of list){
     it.running=true;renderRail();
-    if(pl){pl.classList.add('on');pl.textContent=`Đang tách: ${it.name} (${n+1}/${list.length})`}
-    if(pr)pr.classList.add('on');
-    try{await removeBg(it,p=>{if(pr)pr.firstElementChild.style.width=Math.round(p*100)+'%'})}
+    setProg(0,`Đang tách: ${it.name} (${n+1}/${list.length})`);
+    try{await removeBg(it,(p,lb)=>setProg(p,lb||('Đang tách: '+it.name)))}
     catch(e){console.error(e);toast('Lỗi tách nền: '+it.name)}
     it.running=false;n++;renderAll();
   }
-  if(pr)pr.classList.remove('on');if(pl)pl.classList.remove('on');
+  setProg(-1);
   S.busy=false;toast('Tách nền xong '+n+' ảnh');renderAll();
+}
+function setProg(p,label){
+  const pr=$('#cutProg'),pl=$('#cutLabel');
+  if(!pr||!pl)return;
+  if(p<0){pr.classList.remove('on');pl.classList.remove('on');return}
+  pr.classList.add('on');pl.classList.add('on');
+  pr.firstElementChild.style.width=Math.round(p*100)+'%';
+  if(label)pl.textContent=label;
+}
+
+/* ============================================================
+   AI CÂN CHỈNH THÔNG MINH — phân tích ảnh, tự đặt thông số
+   ============================================================ */
+function analyze(it){
+  const src=it.cut;if(!src)return null;
+  const N=260;const c=mk(N,N);cx(c).drawImage(src,0,0,N,N);
+  const d=cx(c).getImageData(0,0,N,N).data;
+  let n=0,sr=0,sg=0,sb=0;
+  const lh=new Uint32Array(256);
+  for(let i=0;i<N*N;i++){
+    if(d[i*4+3]<40)continue;n++;
+    const R=d[i*4],G=d[i*4+1],B=d[i*4+2];
+    sr+=R;sg+=G;sb+=B;
+    lh[Math.round(0.299*R+0.587*G+0.114*B)]++;
+  }
+  if(n<50)return null;
+  let acc=0,med=128,p5=0,p95=255;
+  for(let v=0;v<256;v++){acc+=lh[v];
+    if(p5===0&&acc>=n*0.05)p5=v;
+    if(acc>=n*0.5){med=v;break}}
+  acc=0;
+  for(let v=255;v>=0;v--){acc+=lh[v];if(acc>=n*0.05){p95=v;break}}
+  return{r:sr/n,g:sg/n,b:sb/n,med,spread:p95-p5};
+}
+function smartAuto(it){
+  const a=analyze(it);if(!a)return false;
+  it.fin.auto=true;it.lut=null;dirty(it);
+  it.fin.bri=clamp(Math.round(100*150/Math.max(70,a.med)),85,128);
+  it.fin.con=a.spread<135?112:104;
+  it.fin.sat=105;
+  const cast=a.r-a.b; // >0: ảnh ám vàng → kéo lạnh; <0: ám xanh → kéo ấm
+  it.fin.warm=clamp(Math.round(-cast*0.45),-35,35);
+  return true;
+}
+function smartAutoAll(){
+  let n=0;S.items.forEach(x=>{if(x.cut&&smartAuto(x))n++});
+  toast('AI đã cân chỉnh '+n+' ảnh');renderAll();
+}
+
+/* ============================================================
+   TỰ ĐỘNG TOÀN BỘ — một nút chạy hết pipeline
+   ============================================================ */
+async function autoRun(){
+  if(!S.items.length){toast('Chưa có ảnh');return}
+  await runCutAll();
+  smartAutoAll();
+  goStep(4);
+  toast('Xử lý tự động xong — kiểm tra rồi bấm Xuất');
 }
 
 /* ============================================================
@@ -652,7 +806,6 @@ function brCompose(){
   g.globalCompositeOperation='destination-out';
   g.drawImage(BR.erase,0,0);
   g.globalCompositeOperation='source-over';
-  // vùng khôi phục: lấy pixel từ ảnh gốc theo mask resto
   const rl=mk(BR.W,BR.H),rg=cx(rl);
   rg.drawImage(BR.resto,0,0);
   rg.globalCompositeOperation='source-in';
@@ -679,7 +832,6 @@ function brStamp(layer,x,y){
 function brPointer(){
   const c=$('#brCanvas');
   const pos=e=>{const b=c.getBoundingClientRect();
-    // toạ độ display → toạ độ full-res qua view transform
     const dx=(e.clientX-b.left)*(c.width/b.width);
     const dy=(e.clientY-b.top)*(c.height/b.height);
     const vx=(dx-BR.view.tx)/BR.view.s,vy=(dy-BR.view.ty)/BR.view.s;
@@ -693,7 +845,7 @@ function brPointer(){
     if(mode==='pan'){BR.last=null;return}
     BR.last=p;
     brStamp(mode==='erase'?BR.erase:BR.resto,p.x,p.y);
-    if(mode==='resto'){ // khôi phục cũng xóa vết tẩy tại chỗ đó
+    if(mode==='resto'){
       const g=cx(BR.erase);g.save();g.globalCompositeOperation='destination-out';
       brStamp(BR.erase,p.x,p.y);g.restore();
     }
@@ -746,7 +898,7 @@ $('#brApply').onclick=()=>{
   const it=cur();
   brCompose();
   const out=mk(BR.W,BR.H);cx(out).drawImage(BR.comp,0,0);
-  it.cutRaw=out;          // giữ chỉnh sửa khi kéo lại slider viền
+  it.cutRaw=out;
   applyEdge(it);
   $('#brModal').classList.remove('on');
   toast('Đã áp dụng cọ nền');renderAll();
@@ -831,8 +983,8 @@ function liqApplyFull(){
   }
   og.putImageData(od,0,0);
   it.cut=out;
-  it.cutRaw=out;          // giữ warp khi chỉnh lại viền
-  it.aligned=null;it.lut=null;
+  it.cutRaw=out;
+  it.aligned=null;it.lut=null;dirty(it);
 }
 
 /* ============================================================
@@ -902,9 +1054,9 @@ function autoAlign(it,withRot){
   it.done[2]=true;renderAll();toast('Đã căn tự động theo khung');
 }
 function bakeAlign(it){
-  if(!it.align.on){it.aligned=null;it.done[2]=true;return}
+  if(!it.align.on){it.aligned=null;it.done[2]=true;dirty(it);return}
   const c=mk(AWS,AWS);drawAligned(it,cx(c));
-  it.aligned=c;it.done[2]=true;
+  it.aligned=c;it.done[2]=true;dirty(it);
 }
 
 /* ============================================================
@@ -930,7 +1082,9 @@ function buildLUT(it){
   }
   return lut;
 }
+/* Cache _adj — chỉ tính lại khi cut/align/auto đổi, kéo slider không treo */
 function adjustedProduct(it){
+  if(it._adj)return it._adj;
   const base=(it.align.on&&it.aligned)?it.aligned:it.cut;
   let c=base;
   if(it.fin.auto){
@@ -943,6 +1097,7 @@ function adjustedProduct(it){
       og.putImageData(id,0,0);c=o;
     }
   }
+  it._adj=c;
   return c;
 }
 function silhouette(prod,color){
@@ -961,11 +1116,11 @@ function alphaBBox(cv){
   const sx=cv.width/N,sy=cv.height/N;
   return{x:x0*sx,y:y0*sy,w:(x1-x0+1)*sx,h:(y1-y0+1)*sy};
 }
-function renderFinal(it,W,H){
+function renderFinal(it,W,H,prodOverride){
   const c=mk(W,H),g=cx(c);
-  g.fillStyle=S.exp.bg;g.fillRect(0,0,W,H);
+  if(S.exp.bgMode==='white'){g.fillStyle='#FFFFFF';g.fillRect(0,0,W,H)}
   if(!it.cut)return c;
-  const prod=adjustedProduct(it);
+  const prod=prodOverride||adjustedProduct(it);
   const bb=alphaBBox(prod);
   const pad=S.exp.pad/100;
   const availW=W*(1-2*pad),availH=H*(1-2*pad);
@@ -1015,58 +1170,67 @@ function renderFinal(it,W,H){
 }
 
 /* ============================================================
-   PRESET NHÓM SẢN PHẨM
+   AI UPSCALE 2× — Swin2SR (Transformers.js), tùy chọn khi xuất
    ============================================================ */
-function snapshotPreset(name){
-  const it=cur();if(!it){toast('Chưa có ảnh để lấy thiết lập');return null}
-  return{name,edge:{...it.edge},fin:{...it.fin},
-    tpl:(it.align.on&&it.align.tpl!=null)?it.align.tpl:-1,
-    exp:{sizes:S.exp.sizes.map(s=>({...s})),pad:S.exp.pad,fmt:S.exp.fmt,q:S.exp.q,pat:S.exp.pat}};
+let _sr=null,_srFailed=false;
+async function srPipe(){
+  if(_sr)return _sr;
+  toast('Đang tải AI upscale (lần đầu ~65MB)…',4000);
+  const T=await import(TJS+'/+esm');
+  const pipe=await T.pipeline('image-to-image','Xenova/swin2SR-lightweight-x2-64',
+    HAS_GPU?{device:'webgpu',dtype:'fp32'}:{});
+  _sr={pipe};
+  return _sr;
 }
-function applyPreset(p,targets){
-  targets.forEach(x=>{
-    x.edge={...p.edge};x.fin={...p.fin};
-    if(p.tpl>=0&&S.templates[p.tpl]){x.align.on=true;x.align.tpl=p.tpl}
-    if(x.cutRaw)applyEdge(x);
-    x.lut=null;
-  });
-  if(p.exp){S.exp={...S.exp,...p.exp,sizes:p.exp.sizes.map(s=>({...s}))};save('nsf_exp',S.exp)}
-  renderAll();
-}
-function presetCard(){
-  const list=S.presets.map((p,i)=>`<div class="preset-it">
-    <b>${p.name}</b>
-    <button data-ap="${i}">Ảnh này</button>
-    <button data-aa="${i}">Tất cả</button>
-    <button class="x" data-dp="${i}">×</button></div>`).join('')
-    ||'<p class="hint" style="margin:0 0 8px">Lưu bộ thiết lập theo nhóm (Mũ bảo hiểm, Nón vải…) để lần sau áp một chạm: viền, bóng, màu, khung mẫu, kích thước xuất.</p>';
-  return card('Preset nhóm sản phẩm',ICO.star,list+
-    `<button class="btn sm full" id="prSave">+ Lưu thiết lập hiện tại thành preset</button>`);
-}
-function bindPresets(){
-  const on=(el,fn)=>{if(el)el.onclick=fn};
-  on($('#prSave'),()=>{
-    const name=prompt('Tên preset (ví dụ: Mũ bảo hiểm nửa đầu):');
-    if(!name)return;
-    const p=snapshotPreset(name.trim());if(!p)return;
-    S.presets.push(p);save('nsf_presets',S.presets);renderPanel();toast('Đã lưu preset "'+p.name+'"');
-  });
-  $$('[data-ap]').forEach(b=>b.onclick=()=>{const it=cur();if(it)applyPreset(S.presets[+b.dataset.ap],[it]);toast('Đã áp preset cho ảnh này')});
-  $$('[data-aa]').forEach(b=>b.onclick=()=>{applyPreset(S.presets[+b.dataset.aa],S.items);toast('Đã áp preset cho tất cả')});
-  $$('[data-dp]').forEach(b=>b.onclick=()=>{S.presets.splice(+b.dataset.dp,1);save('nsf_presets',S.presets);renderPanel()});
+async function upscaled(it){
+  if(it._sr)return it._sr;
+  const prod=adjustedProduct(it);
+  const bb=alphaBBox(prod);
+  if(Math.max(bb.w,bb.h)>1500){toast('Ảnh đã đủ lớn — bỏ qua upscale');return prod}
+  // cắt riêng vùng sản phẩm để chạy nhanh
+  const crop=mk(Math.round(bb.w),Math.round(bb.h));
+  cx(crop).drawImage(prod,bb.x,bb.y,bb.w,bb.h,0,0,crop.width,crop.height);
+  const {pipe}=await srPipe();
+  const out=await pipe(crop.toDataURL('image/png'));
+  let big;
+  if(out&&typeof out.toCanvas==='function'){big=out.toCanvas()}
+  else{
+    const ch=out.channels||3;
+    const px=new Uint8ClampedArray(out.width*out.height*4);
+    for(let i=0;i<out.width*out.height;i++){
+      px[i*4]=out.data[i*ch];px[i*4+1]=out.data[i*ch+1];px[i*4+2]=out.data[i*ch+2];px[i*4+3]=255;
+    }
+    big=mk(out.width,out.height);
+    cx(big).putImageData(new ImageData(px,out.width,out.height),0,0);
+  }
+  // Swin2SR trả RGB — ghép lại alpha từ bản gốc phóng 2×
+  const W=big.width,H=big.height;
+  const am=mk(W,H);cx(am).drawImage(crop,0,0,W,H);
+  const ad=cx(am).getImageData(0,0,W,H).data;
+  const bg2=cx(big).getImageData(0,0,W,H);
+  for(let i=0;i<W*H;i++)bg2.data[i*4+3]=ad[i*4+3];
+  cx(big).putImageData(bg2,0,0);
+  it._sr=big;
+  return big;
 }
 
 /* ============================================================
-   BƯỚC 4 — XUẤT (đa kích thước, mẫu tên file)
+   BƯỚC 4 — XUẤT (đa kích thước, mẫu tên file, upscale)
    ============================================================ */
 const firstSize=()=>S.exp.sizes.find(s=>s.on)||S.exp.sizes[0]||{w:1200,h:1200};
 const fname=(it,w,h,i)=>S.exp.pat
   .replace(/\{ten\}/g,it.name).replace(/\{w\}/g,w).replace(/\{h\}/g,h)
-  .replace(/\{stt\}/g,String(i+1).padStart(2,'0'))+'.'+S.exp.fmt;
+  .replace(/\{stt\}/g,String(i+1).padStart(2,'0'))+'.'+(S.exp.bgMode==='trans'?'png':S.exp.fmt);
 async function renderBlob(it,w,h){
-  const c=renderFinal(it,w,h);
-  const mime=S.exp.fmt==='png'?'image/png':'image/jpeg';
-  return new Promise(r=>c.toBlob(r,mime,S.exp.q/100));
+  let prodOv=null;
+  if(S.exp.sr&&!_srFailed){
+    try{prodOv=await upscaled(it)}
+    catch(e){console.error('Upscale lỗi:',e);_srFailed=true;
+      toast('AI upscale không chạy được — xuất với chất lượng gốc')}
+  }
+  const c=renderFinal(it,w,h,prodOv);
+  const png=S.exp.bgMode==='trans'||S.exp.fmt==='png';
+  return new Promise(r=>c.toBlob(r,png?'image/png':'image/jpeg',S.exp.q/100));
 }
 function dl(name,blob){const a=document.createElement('a');a.href=URL.createObjectURL(blob);
   a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000)}
@@ -1107,6 +1271,48 @@ async function exportAll(){
 }
 
 /* ============================================================
+   PRESET NHÓM SẢN PHẨM
+   ============================================================ */
+function snapshotPreset(name){
+  const it=cur();if(!it){toast('Chưa có ảnh để lấy thiết lập');return null}
+  return{name,edge:{...it.edge},fin:{...it.fin},
+    tpl:(it.align.on&&it.align.tpl!=null)?it.align.tpl:-1,
+    exp:{sizes:S.exp.sizes.map(s=>({...s})),pad:S.exp.pad,fmt:S.exp.fmt,q:S.exp.q,pat:S.exp.pat,bgMode:S.exp.bgMode,sr:S.exp.sr}};
+}
+function applyPreset(p,targets){
+  targets.forEach(x=>{
+    x.edge={...p.edge};x.fin={...p.fin};
+    if(p.tpl>=0&&S.templates[p.tpl]){x.align.on=true;x.align.tpl=p.tpl}
+    if(x.cutRaw)applyEdge(x);
+    x.lut=null;dirty(x);
+  });
+  if(p.exp){S.exp={...S.exp,...p.exp,sizes:p.exp.sizes.map(s=>({...s}))};save('nsf_exp',S.exp)}
+  renderAll();
+}
+function presetCard(){
+  const list=S.presets.map((p,i)=>`<div class="preset-it">
+    <b>${p.name}</b>
+    <button data-ap="${i}">Ảnh này</button>
+    <button data-aa="${i}">Tất cả</button>
+    <button class="x" data-dp="${i}">×</button></div>`).join('')
+    ||'<p class="hint" style="margin:0 0 8px">Lưu bộ thiết lập theo nhóm (Mũ bảo hiểm, Nón vải…) để lần sau áp một chạm: viền, bóng, màu, khung mẫu, kích thước xuất.</p>';
+  return card('Preset nhóm sản phẩm',ICO.star,list+
+    `<button class="btn sm full" id="prSave">+ Lưu thiết lập hiện tại thành preset</button>`);
+}
+function bindPresets(){
+  const el=$('#prSave');
+  if(el)el.onclick=()=>{
+    const name=prompt('Tên preset (ví dụ: Mũ bảo hiểm nửa đầu):');
+    if(!name)return;
+    const p=snapshotPreset(name.trim());if(!p)return;
+    S.presets.push(p);save('nsf_presets',S.presets);renderPanel();toast('Đã lưu preset "'+p.name+'"');
+  };
+  $$('[data-ap]').forEach(b=>b.onclick=()=>{const it=cur();if(it)applyPreset(S.presets[+b.dataset.ap],[it]);toast('Đã áp preset cho ảnh này')});
+  $$('[data-aa]').forEach(b=>b.onclick=()=>{applyPreset(S.presets[+b.dataset.aa],S.items);toast('Đã áp preset cho tất cả')});
+  $$('[data-dp]').forEach(b=>b.onclick=()=>{S.presets.splice(+b.dataset.dp,1);save('nsf_presets',S.presets);renderPanel()});
+}
+
+/* ============================================================
    PANEL THEO BƯỚC
    ============================================================ */
 const ICO={
@@ -1116,7 +1322,9 @@ const ICO={
   sun:'<circle cx="12" cy="12" r="4"/><path d="M12 3v2m0 14v2M4 12H2m20 0h-2"/>',
   out:'<path d="M12 15V3m0 12l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/>',
   copy:'<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M4 16V6a2 2 0 012-2h10"/>',
-  star:'<path d="M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z"/>'
+  star:'<path d="M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z"/>',
+  bolt:'<path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/>',
+  brain:'<path d="M9 4a3 3 0 00-3 3v1a3 3 0 000 6v1a3 3 0 003 3m6-14a3 3 0 013 3v1a3 3 0 010 6v1a3 3 0 01-3 3M12 4v16"/>'
 };
 const card=(t,ic,body)=>`<div class="card"><h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">${ic}</svg>${t}</h3>${body}</div>`;
 const slider=(id,lb,min,max,val,step=1)=>`<div class="row"><label>${lb}</label>
@@ -1135,19 +1343,29 @@ function renderPanel(){
         <button class="btn" id="btnPick">Chọn ảnh</button>
         <button class="btn teal" id="btnCam"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Chụp ảnh</button>
       </div>
-      <p class="hint">Ảnh gốc chỉ xử lý trong máy — không upload lên server nào. Ảnh lớn tự thu về tối đa 2600px cạnh dài để chạy nhanh trên iPhone.</p>`);
-    if(S.items.length)h+=`<button class="btn gold full" id="btnGo1">Bắt đầu tách nền (${S.items.length} ảnh) →</button>`;
+      <p class="hint">Ảnh gốc chỉ xử lý trong máy — không upload lên server nào.</p>`);
+    if(S.items.length){
+      h+=card('Chạy tự động',ICO.bolt,`
+        <button class="btn gold full" id="btnAuto"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none">${ICO.bolt}</svg>Xử lý tự động toàn bộ (${S.items.length} ảnh)</button>
+        <p class="hint">Tách nền → AI cân sáng &amp; màu từng ảnh → nhảy tới bước Xuất. Anh chỉ kiểm tra rồi tải về.</p>
+        <div class="btn-row" style="margin-top:8px"><button class="btn" id="btnGo1">Làm từng bước →</button></div>`);
+    }
     if(S.presets.length)h+=presetCard();
   }
   if(S.step===1){
     h+=card('Tách nền AI',ICO.scis,`
+      <div class="row"><label>Engine</label>
+        <select id="engSel" style="flex:1.4;width:auto">
+          <option value="biref" ${S.engine==='biref'?'selected':''}>BiRefNet (nét, ${HAS_GPU?'WebGPU':'chậm — không có GPU'})</option>
+          <option value="std" ${S.engine==='std'?'selected':''}>Tiêu chuẩn (nhanh, WASM)</option>
+        </select></div>
       <div class="btn-row">
         <button class="btn gold" id="btnCutAll" ${S.busy?'disabled':''}>Tách tất cả</button>
         <button class="btn" id="btnCutOne" ${!it||S.busy?'disabled':''}>Tách ảnh này</button>
       </div>
       <div class="prog" id="cutProg"><i></i></div>
       <div class="plabel" id="cutLabel"></div>
-      <p class="hint">Model AI chạy ngay trong trình duyệt (miễn phí, không giới hạn). Lần đầu tải model hơi lâu, các lần sau gần như tức thì.</p>`);
+      <p class="hint">BiRefNet cho biên quai nón, lưới thoáng khí sạch hơn; cần tải model lần đầu (~90MB). Nếu máy không chạy được sẽ tự chuyển engine tiêu chuẩn.</p>`);
     if(it&&it.cutRaw){
       h+=card('Viền cong mềm',ICO.frame,
         slider('edSmooth','Độ bo cong',0,10,it.edge.smooth,0.5)+
@@ -1156,7 +1374,7 @@ function renderPanel(){
           <button class="btn sm" id="edCopy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">${ICO.copy}</svg>Áp cho tất cả</button>
           <button class="btn sm" id="btnBr2">Cọ nền</button>
           <button class="btn sm" id="btnLiq2">Liquify</button></div>
-        <p class="hint">Bo cong làm mềm các đoạn gấp khúc thành đường cong tự nhiên; độ sắc giữ biên gọn, không mờ. Cọ nền để tẩy phần thừa hoặc khôi phục phần AI cắt lẹm.</p>`);
+        <p class="hint">Bo cong làm mềm các đoạn gấp khúc thành đường cong tự nhiên; độ sắc giữ biên gọn, không mờ.</p>`);
     }
     h+=presetCard();
   }
@@ -1183,8 +1401,14 @@ function renderPanel(){
   }
   if(S.step===3&&it&&it.cut){
     const f=it.fin;
+    h+=card('AI cân chỉnh thông minh',ICO.brain,`
+      <div class="btn-row">
+        <button class="btn teal" id="smOne">Ảnh này</button>
+        <button class="btn teal" id="smAll">Tất cả</button></div>
+      <p class="hint">Phân tích từng ảnh: độ sáng trung vị, dải tương phản, ám màu — rồi tự đặt Sáng / Tương phản / Ấm-lạnh riêng cho ảnh đó.</p>`);
     h+=card('Cân sáng & màu',ICO.sun,`
-      <div class="row"><label>Tự cân sáng chuẩn</label><span class="sw"><input type="checkbox" id="fAuto" ${f.auto?'checked':''}><i></i></span></div>`+
+      <div class="row"><label>Tự cân sáng chuẩn</label><span class="sw"><input type="checkbox" id="fAuto" ${f.auto?'checked':''}><i></i></span></div>
+      <div class="row"><label>Chỉnh đồng loạt tất cả ảnh</label><span class="sw"><input type="checkbox" id="fSync" ${S.sync?'checked':''}><i></i></span></div>`+
       slider('fBri','Sáng',70,140,f.bri)+
       slider('fCon','Tương phản',70,140,f.con)+
       slider('fSat','Màu sắc',60,150,f.sat)+
@@ -1209,18 +1433,22 @@ function renderPanel(){
       sizeRows+
       `<button class="btn sm full" id="szAdd" style="margin:2px 0 10px">+ Thêm kích thước</button>`+
       slider('exPad','Lề trắng (%)',0,25,S.exp.pad)+
-      `<div class="row"><label>Định dạng</label><select id="exFmt" style="flex:1.4;width:auto">
-        <option value="jpg" ${S.exp.fmt==='jpg'?'selected':''}>JPG (nền trắng)</option>
+      `<div class="row"><label>Nền</label><select id="exBg" style="flex:1.4;width:auto">
+        <option value="white" ${S.exp.bgMode==='white'?'selected':''}>Trắng</option>
+        <option value="trans" ${S.exp.bgMode==='trans'?'selected':''}>Trong suốt (PNG)</option></select></div>
+      <div class="row"><label>Định dạng</label><select id="exFmt" style="flex:1.4;width:auto" ${S.exp.bgMode==='trans'?'disabled':''}>
+        <option value="jpg" ${S.exp.fmt==='jpg'?'selected':''}>JPG</option>
         <option value="png" ${S.exp.fmt==='png'?'selected':''}>PNG</option></select></div>`+
       slider('exQ','Chất lượng',70,100,S.exp.q)+
-      `<div class="row"><label>Mẫu tên file</label></div>
+      `<div class="row" style="margin-top:2px"><label>AI upscale 2× (Swin2SR)</label><span class="sw"><input type="checkbox" id="exSr" ${S.exp.sr?'checked':''}><i></i></span></div>
+      <div class="row"><label>Mẫu tên file</label></div>
       <input type="text" id="exPat" value="${S.exp.pat}">
-      <p class="hint">Từ khóa: {ten} tên ảnh gốc · {w} {h} kích thước · {stt} số thứ tự. Nhiều kích thước sẽ chia thư mục trong ZIP.</p>`);
+      <p class="hint">Từ khóa: {ten} tên ảnh · {w} {h} kích thước · {stt} số thứ tự. Upscale AI phóng nét sản phẩm 2× trước khi ghép — chậm hơn nhưng nét hơn khi xuất cỡ lớn.</p>`);
     h+=card('Xuất ảnh',ICO.out,`
       <div class="btn-row">
         <button class="btn" id="exOne" ${!it||!it.cut?'disabled':''}>Ảnh này</button>
         <button class="btn gold" id="exAllB">Tất cả (ZIP)</button></div>
-      <p class="hint">Ảnh xuất render lại từ gốc ở đúng kích thước — giữ nguyên chi tiết và độ sắc nét, không phóng từ preview.</p>`);
+      <p class="hint">Ảnh xuất render lại từ gốc ở đúng kích thước — không phóng từ preview.</p>`);
     h+=presetCard();
   }
   p.innerHTML=h;
@@ -1236,18 +1464,20 @@ function bindPanel(){
   on('btnPick','onclick',()=>$('#fileIn').click());
   on('btnCam','onclick',()=>$('#camIn').click());
   on('btnGo1','onclick',()=>goStep(1));
+  on('btnAuto','onclick',()=>{goStep(1);setTimeout(autoRun,50)});
   const drop=$('#drop');
   if(drop){drop.onclick=()=>$('#fileIn').click();
     drop.ondragover=e=>{e.preventDefault();drop.classList.add('hover')};
     drop.ondragleave=()=>drop.classList.remove('hover');
     drop.ondrop=e=>{e.preventDefault();drop.classList.remove('hover');addFiles(e.dataTransfer.files)}}
   // step 1
+  on('engSel','onchange',()=>{S.engine=$('#engSel').value;save('nsf_engine',S.engine)});
   on('btnCutAll','onclick',runCutAll);
   on('btnCutOne','onclick',async()=>{if(!it)return;S.busy=true;it.running=true;renderRail();
-    const pr=$('#cutProg'),pl=$('#cutLabel');if(pr)pr.classList.add('on');if(pl){pl.classList.add('on');pl.textContent='Đang tách: '+it.name}
-    try{await removeBg(it,p=>{if(pr)pr.firstElementChild.style.width=Math.round(p*100)+'%'})}
+    setProg(0,'Đang tách: '+it.name);
+    try{await removeBg(it,(p,lb)=>setProg(p,lb||('Đang tách: '+it.name)))}
     catch(e){console.error(e);toast('Lỗi tách nền')}
-    it.running=false;S.busy=false;renderAll()});
+    setProg(-1);it.running=false;S.busy=false;renderAll()});
   bindSlider('edSmooth',v=>{it.edge.smooth=v;applyEdge(it)});
   bindSlider('edSharp',v=>{it.edge.sharp=v;applyEdge(it)});
   on('edCopy','onclick',()=>{S.items.forEach(x=>{if(x===it||!x.cutRaw)return;x.edge={...it.edge};applyEdge(x)});toast('Đã áp viền cho tất cả');renderAll()});
@@ -1260,7 +1490,7 @@ function bindPanel(){
       if(it){it.align.tpl=+el.dataset.i;renderPanel();renderStage()}};
   });
   on('btnTplAdd','onclick',()=>$('#tplIn').click());
-  on('alOn','onchange',()=>{it.align.on=$('#alOn').checked;it.aligned=null;
+  on('alOn','onchange',()=>{it.align.on=$('#alOn').checked;it.aligned=null;dirty(it);
     if(!it.align.on)it.done[2]=true;renderPanel();renderStage()});
   on('alAuto','onclick',()=>{autoAlign(it,false);bakeAlign(it);renderPanel();renderStage()});
   on('alAutoR','onclick',()=>{autoAlign(it,true);bakeAlign(it);renderPanel();renderStage()});
@@ -1269,11 +1499,17 @@ function bindPanel(){
   bindSlider('alTx',v=>{it.align.tx=v;bakeAlign(it)});
   bindSlider('alTy',v=>{it.align.ty=v;bakeAlign(it)});
   // step 3
-  on('fAuto','onchange',()=>{it.fin.auto=$('#fAuto').checked;renderStage()});
+  on('smOne','onclick',()=>{if(smartAuto(it)){toast('AI đã cân chỉnh ảnh này');renderAll()}});
+  on('smAll','onclick',smartAutoAll);
+  on('fAuto','onchange',()=>{it.fin.auto=$('#fAuto').checked;it.lut=null;dirty(it);renderStage()});
+  on('fSync','onchange',()=>{S.sync=$('#fSync').checked;toast(S.sync?'Kéo slider sẽ áp cho tất cả ảnh':'Chỉnh riêng từng ảnh')});
   ['fBri:bri','fCon:con','fSat:sat','fWarm:warm','fContact:contact','fSOp:sOp','fSBlur:sBlur','fSDist:sDist','fGloss:gloss']
-    .forEach(m=>{const[id,k]=m.split(':');bindSlider(id,v=>it.fin[k]=v)});
+    .forEach(m=>{const[id,k]=m.split(':');bindSlider(id,v=>{
+      if(S.sync)S.items.forEach(x=>x.fin[k]=v);
+      else it.fin[k]=v;
+    })});
   on('fCopy','onclick',()=>{S.items.forEach(x=>{if(x!==it)x.fin={...it.fin}});toast('Đã áp thiết lập cho tất cả');});
-  // step 4 — danh sách kích thước
+  // step 4
   $$('[data-son]').forEach(el=>el.onchange=()=>{S.exp.sizes[+el.dataset.son].on=el.checked;save('nsf_exp',S.exp);renderStage()});
   $$('[data-sw]').forEach(el=>el.onchange=()=>{S.exp.sizes[+el.dataset.sw].w=clamp(+el.value||1200,100,6000);save('nsf_exp',S.exp);renderStage()});
   $$('[data-sh]').forEach(el=>el.onchange=()=>{S.exp.sizes[+el.dataset.sh].h=clamp(+el.value||1200,100,6000);save('nsf_exp',S.exp);renderStage()});
@@ -1281,8 +1517,11 @@ function bindPanel(){
     S.exp.sizes.splice(+el.dataset.sdel,1);save('nsf_exp',S.exp);renderPanel();renderStage()});
   on('szAdd','onclick',()=>{S.exp.sizes.push({w:1000,h:1000,on:true});save('nsf_exp',S.exp);renderPanel()});
   bindSlider('exPad',v=>{S.exp.pad=v;save('nsf_exp',S.exp)});
+  on('exBg','onchange',()=>{S.exp.bgMode=$('#exBg').value;save('nsf_exp',S.exp);renderPanel();renderStage()});
   on('exFmt','onchange',()=>{S.exp.fmt=$('#exFmt').value;save('nsf_exp',S.exp);renderStage()});
   bindSlider('exQ',v=>{S.exp.q=v;save('nsf_exp',S.exp)},false);
+  on('exSr','onchange',()=>{S.exp.sr=$('#exSr').checked;save('nsf_exp',S.exp);
+    if(S.exp.sr)toast('AI upscale bật — lần xuất đầu sẽ tải model (~65MB)')});
   on('exPat','onchange',()=>{S.exp.pat=$('#exPat').value||'{ten}_{w}x{h}';save('nsf_exp',S.exp)});
   on('exOne','onclick',exportCurrent);
   on('exAllB','onclick',exportAll);
@@ -1313,7 +1552,7 @@ $('#camIn').onchange=e=>{addFiles(e.target.files);e.target.value=''};
 document.addEventListener('dragover',e=>e.preventDefault());
 document.addEventListener('drop',e=>{e.preventDefault();addFiles(e.dataTransfer.files)});
 
-/* ---------- Liquify wiring ---------- */
+/* ---------- Modal wiring ---------- */
 liqPointer();
 brPointer();
 crPointer();
@@ -1326,6 +1565,8 @@ $('#liqApply').onclick=()=>{
   toast('Đã áp dụng chỉnh form');renderAll();
 };
 
+$('#gpuTag').textContent=HAS_GPU?'WebGPU':'WASM';
+$('#gpuTag').classList.toggle('on',HAS_GPU);
 stageZoomPan();
 renderAll();
 </script>
